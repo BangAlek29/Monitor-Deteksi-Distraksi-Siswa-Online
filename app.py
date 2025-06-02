@@ -1,387 +1,455 @@
+import streamlit as st
 import cv2
 import numpy as np
 from ultralytics import YOLO
+from PIL import Image
 import time
-import threading
-from collections import deque
-import matplotlib.pyplot as plt
-from datetime import datetime
-import os
 
-class RealtimeAttentionMonitor:
-    def __init__(self, model_path="best.pt", confidence_threshold=0.6):
-        """
-        Initialize the realtime attention monitor
-        """
-        self.model_path = model_path
-        self.confidence_threshold = confidence_threshold
-        self.model = None
-        self.cap = None
-        self.running = False
-        
-        # Status tracking
-        self.current_status = "Standby"
-        self.status_history = deque(maxlen=100)  # Keep last 100 status updates
-        self.focus_sessions = 0
-        self.total_focused_time = 0
-        self.session_start_time = None
-        self.last_status_change = time.time()
-        
-        # Performance metrics
-        self.fps_counter = deque(maxlen=30)
-        self.frame_count = 0
-        
-        # Colors for different statuses
-        self.colors = {
-            "Engaged": (0, 255, 0),      # Green
-            "Compromised": (0, 0, 255),  # Red
-            "Standby": (128, 128, 128)   # Gray
-        }
-        
-        # Load model
-        self.load_model()
-        
-    def load_model(self):
-        """Load YOLO model"""
-        try:
-            self.model = YOLO(self.model_path)
-            print(f"✅ Model loaded successfully: {self.model_path}")
-        except Exception as e:
-            print(f"❌ Error loading model: {e}")
-            print("💡 Trying to load default YOLOv8n model...")
-            try:
-                self.model = YOLO("yolov8n.pt")
-                print("✅ Default YOLOv8n model loaded")
-            except Exception as e2:
-                print(f"❌ Failed to load any model: {e2}")
-                self.model = None
+# Konfigurasi halaman
+st.set_page_config(
+    page_title="Student Engagement Monitoring System", page_icon="🎓", layout="centered"
+)
+
+# CSS untuk styling
+st.markdown(
+    """
+<style>
+    .status-alert {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 1rem 0;
+        font-weight: bold;
+        text-align: center;
+        font-size: 1.2rem;
+    }
+    .status-engaged { background-color: #d4edda; color: #155724; border: 2px solid #c3e6cb; }
+    .status-compromised { background-color: #f8d7da; color: #721c24; border: 2px solid #f5c6cb; }
+    .status-unknown { background-color: #e2e3e5; color: #383d41; border: 2px solid #d6d8db; }
     
-    def classify_attention(self, results):
-        """Classify attention level based on detection results"""
-        person_detected = False
-        max_confidence = 0
-        face_area = 0
-        
-        for result in results:
-            boxes = result.boxes
-            if boxes is not None:
-                for box in boxes:
-                    confidence = float(box.conf[0])
+    .metric-card {
+        background: #f8f9fa;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border: 1px solid #dee2e6;
+        text-align: center;
+    }
+    
+    .header-container {
+        text-align: center;
+        padding: 1rem;
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        border-radius: 10px;
+        color: white;
+        margin-bottom: 2rem;
+    }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# Mapping status dan warna untuk siswa
+STATUS_CONFIG = {
+    "engaged": {
+        "color": "status-engaged",
+        "emoji": "🎯",
+        "level": "FOKUS",
+        "description": "Siswa fokus mengikuti pembelajaran",
+    },
+    "compromised": {
+        "color": "status-compromised",
+        "emoji": "😴",
+        "level": "DISTRAKSI",
+        "description": "Siswa tidak fokus atau mengantuk",
+    },
+}
+
+
+@st.cache_resource
+def load_model():
+    """Load YOLO model untuk deteksi engagement siswa"""
+    try:
+        # Pastikan model sudah dilatih untuk mendeteksi engaged dan compromised
+        model = YOLO("best.pt")  # Ganti dengan path model yang sesuai
+        return model
+    except Exception as e:
+        st.error(f"❌ Error loading model: {e}")
+        st.info(
+            "💡 Pastikan file model 'best.pt' tersedia dan sudah dilatih untuk deteksi engagement siswa"
+        )
+        return None
+
+
+def get_student_status(results, confidence_threshold=0.5):
+    """Ambil status engagement siswa dengan confidence tertinggi"""
+    best_detection = None
+    max_confidence = 0
+
+    for result in results:
+        boxes = result.boxes
+        if boxes is not None:
+            for box in boxes:
+                confidence = float(box.conf[0])
+                if confidence >= confidence_threshold and confidence > max_confidence:
                     class_id = int(box.cls[0])
-                    
-                    # Class 0 is usually 'person' in YOLO
-                    if class_id == 0 and confidence >= self.confidence_threshold:
-                        person_detected = True
-                        max_confidence = max(max_confidence, confidence)
-                        
-                        # Calculate face area (as a proxy for attention)
-                        x1, y1, x2, y2 = box.xyxy[0]
-                        area = (x2 - x1) * (y2 - y1)
-                        face_area = max(face_area, area)
-        
-        # Determine status based on detection
-        if person_detected and max_confidence > 0.7:
-            return {
-                "status": "Engaged",
-                "confidence": max_confidence,
-                "detected": True,
-                "area": face_area
-            }
-        elif person_detected:
-            return {
-                "status": "Engaged",
-                "confidence": max_confidence,
-                "detected": True,
-                "area": face_area
-            }
-        else:
-            return {
-                "status": "Compromised",
-                "confidence": 0.0,
-                "detected": False,
-                "area": 0
-            }
-    
-    def draw_interface(self, frame, detection_result):
-        """Draw monitoring interface on frame"""
-        height, width = frame.shape[:2]
-        
-        # Create overlay
-        overlay = frame.copy()
-        
-        # Status panel
-        status = detection_result["status"]
-        confidence = detection_result["confidence"]
-        
-        # Draw status panel background
-        panel_height = 120
-        cv2.rectangle(overlay, (0, 0), (width, panel_height), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-        
-        # Status text
-        status_color = self.colors[status]
-        cv2.putText(frame, f"Status: {status}", (20, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
-        
-        if detection_result["detected"]:
-            cv2.putText(frame, f"Confidence: {confidence:.3f}", (20, 60), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        
-        # Session metrics
-        if self.session_start_time:
-            elapsed = time.time() - self.session_start_time
-            minutes, seconds = divmod(int(elapsed), 60)
-            cv2.putText(frame, f"Session: {minutes:02d}:{seconds:02d}", (20, 90), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        
-        cv2.putText(frame, f"Focus Sessions: {self.focus_sessions}", (250, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        
-        # FPS counter
-        if len(self.fps_counter) > 1:
-            fps = len(self.fps_counter) / (self.fps_counter[-1] - self.fps_counter[0])
-            cv2.putText(frame, f"FPS: {fps:.1f}", (width - 120, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        
-        # Instructions panel
-        instructions = [
-            "Press 'q' to quit",
-            "Press 'r' to reset session",
-            "Press 's' to save screenshot",
-            "Press 'c' to change confidence threshold"
-        ]
-        
-        for i, instruction in enumerate(instructions):
-            cv2.putText(frame, instruction, (20, height - 80 + i * 20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        
-        return frame
-    
-    def draw_detection_boxes(self, frame, results):
-        """Draw detection bounding boxes"""
-        for result in results:
-            boxes = result.boxes
-            if boxes is not None:
-                for box in boxes:
-                    confidence = float(box.conf[0])
-                    class_id = int(box.cls[0])
-                    
-                    if confidence >= self.confidence_threshold and class_id == 0:
-                        # Get coordinates
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        
-                        # Choose color based on confidence
-                        if confidence > 0.8:
-                            color = (0, 255, 0)  # High confidence - Green
-                        elif confidence > 0.6:
-                            color = (0, 255, 255)  # Medium confidence - Yellow
-                        else:
-                            color = (0, 165, 255)  # Low confidence - Orange
-                        
-                        # Draw rectangle
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                        
-                        # Draw label
-                        label = f"Person: {confidence:.2f}"
-                        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
-                        cv2.rectangle(frame, (x1, y1 - label_size[1] - 10), 
-                                    (x1 + label_size[0], y1), color, -1)
-                        cv2.putText(frame, label, (x1, y1 - 5), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-        
-        return frame
-    
-    def update_status(self, new_status):
-        """Update attention status and track changes"""
-        current_time = time.time()
-        
-        if new_status != self.current_status:
-            # Status changed
-            if new_status == "Engaged" and self.current_status != "Engaged":
-                self.focus_sessions += 1
-                print(f"📈 Focus session #{self.focus_sessions} started")
-            
-            self.current_status = new_status
-            self.last_status_change = current_time
-            
-        # Add to history
-        self.status_history.append({
-            "timestamp": current_time,
-            "status": new_status,
-            "session": self.focus_sessions
-        })
-    
-    def save_screenshot(self, frame):
-        """Save current frame as screenshot"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"attention_screenshot_{timestamp}.jpg"
-        cv2.imwrite(filename, frame)
-        print(f"📸 Screenshot saved: {filename}")
-        return filename
-    
-    def start_monitoring(self, camera_index=0):
-        """Start realtime monitoring"""
-        if self.model is None:
-            print("❌ No model loaded. Cannot start monitoring.")
-            return
-        
-        # Initialize camera
-        self.cap = cv2.VideoCapture(camera_index)
-        if not self.cap.isOpened():
-            print("❌ Error: Could not open camera")
-            return
-        
-        # Set camera properties for better performance
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-        
-        print("🎥 Starting realtime monitoring...")
-        print("📋 Controls:")
-        print("   - Press 'q' to quit")
-        print("   - Press 'r' to reset session")
-        print("   - Press 's' to save screenshot")
-        print("   - Press 'c' to change confidence threshold")
-        print("   - Press SPACE to pause/resume")
-        
-        self.running = True
-        self.session_start_time = time.time()
-        paused = False
-        
-        try:
-            while self.running:
-                if not paused:
-                    ret, frame = self.cap.read()
-                    if not ret:
-                        print("❌ Failed to read frame from camera")
-                        break
-                    
-                    # Update FPS counter
-                    current_time = time.time()
-                    self.fps_counter.append(current_time)
-                    
-                    # Run detection
-                    results = self.model(frame, verbose=False)
-                    detection_result = self.classify_attention(results)
-                    
-                    # Update status
-                    self.update_status(detection_result["status"])
-                    
-                    # Draw detection boxes
-                    frame = self.draw_detection_boxes(frame, results)
-                    
-                    # Draw interface
-                    frame = self.draw_interface(frame, detection_result)
-                    
-                    # Show frame
-                    cv2.imshow('Student Attention Monitor - Realtime', frame)
-                
-                # Handle keyboard input
-                key = cv2.waitKey(1) & 0xFF
-                
-                if key == ord('q'):
-                    print("🛑 Stopping monitoring...")
-                    break
-                elif key == ord('r'):
-                    self.reset_session()
-                    print("🔄 Session reset")
-                elif key == ord('s'):
-                    if not paused:
-                        self.save_screenshot(frame)
-                elif key == ord('c'):
-                    self.change_confidence_threshold()
-                elif key == ord(' '):  # Space key
-                    paused = not paused
-                    status_text = "⏸️ PAUSED" if paused else "▶️ RESUMED"
-                    print(f"{status_text}")
-                
-        except KeyboardInterrupt:
-            print("\n🛑 Monitoring interrupted by user")
-        
-        finally:
-            self.stop_monitoring()
-    
-    def change_confidence_threshold(self):
-        """Interactive confidence threshold change"""
-        print(f"\n🎯 Current confidence threshold: {self.confidence_threshold}")
-        try:
-            new_threshold = float(input("Enter new threshold (0.1-0.9): "))
-            if 0.1 <= new_threshold <= 0.9:
-                self.confidence_threshold = new_threshold
-                print(f"✅ Confidence threshold updated to: {new_threshold}")
-            else:
-                print("❌ Invalid threshold. Must be between 0.1 and 0.9")
-        except ValueError:
-            print("❌ Invalid input. Please enter a number.")
-    
-    def reset_session(self):
-        """Reset monitoring session"""
-        self.focus_sessions = 0
-        self.total_focused_time = 0
-        self.session_start_time = time.time()
-        self.status_history.clear()
-        self.current_status = "Standby"
-    
-    def stop_monitoring(self):
-        """Stop monitoring and cleanup"""
-        self.running = False
-        if self.cap:
-            self.cap.release()
-        cv2.destroyAllWindows()
-        
-        # Print session summary
-        if self.session_start_time:
-            total_time = time.time() - self.session_start_time
-            minutes, seconds = divmod(int(total_time), 60)
-            print(f"\n📊 Session Summary:")
-            print(f"   ⏱️  Total time: {minutes:02d}:{seconds:02d}")
-            print(f"   🎯 Focus sessions: {self.focus_sessions}")
-            print(f"   📈 Status changes: {len(self.status_history)}")
-        
-        print("👋 Monitoring stopped. Thanks for using Student Attention Monitor!")
-    
-    def generate_report(self):
-        """Generate attention report from history"""
-        if not self.status_history:
-            print("❌ No data available for report")
-            return
-        
-        # Calculate statistics
-        engaged_count = sum(1 for entry in self.status_history if entry["status"] == "Engaged")
-        total_count = len(self.status_history)
-        engagement_rate = (engaged_count / total_count) * 100 if total_count > 0 else 0
-        
-        print(f"\n📋 Attention Report:")
-        print(f"   📊 Engagement Rate: {engagement_rate:.1f}%")
-        print(f"   ✅ Engaged Frames: {engaged_count}/{total_count}")
-        print(f"   🎯 Focus Sessions: {self.focus_sessions}")
-        
-        # Save detailed report
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_file = f"attention_report_{timestamp}.txt"
-        
-        with open(report_file, 'w') as f:
-            f.write("Student Attention Monitoring Report\n")
-            f.write("=" * 40 + "\n\n")
-            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Engagement Rate: {engagement_rate:.1f}%\n")
-            f.write(f"Engaged Frames: {engaged_count}/{total_count}\n")
-            f.write(f"Focus Sessions: {self.focus_sessions}\n\n")
-            
-            f.write("Status History:\n")
-            f.write("-" * 20 + "\n")
-            for entry in self.status_history:
-                timestamp = datetime.fromtimestamp(entry["timestamp"]).strftime('%H:%M:%S')
-                f.write(f"{timestamp} - {entry['status']} (Session #{entry['session']})\n")
-        
-        print(f"📄 Detailed report saved: {report_file}")
+                    class_name = result.names[class_id].lower()
+
+                    # Hanya terima deteksi engaged atau compromised
+                    if class_name in ["engaged", "compromised"]:
+                        max_confidence = confidence
+                        best_detection = {
+                            "status": class_name,
+                            "confidence": confidence,
+                            "bbox": box.xyxy[0].tolist(),
+                        }
+
+    return best_detection
+
+
+def draw_detection(image, detection):
+    """Gambar bounding box pada gambar siswa"""
+    if detection is None:
+        return image
+
+    img_array = np.array(image)
+    img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+
+    # Ambil koordinat
+    x1, y1, x2, y2 = map(int, detection["bbox"])
+    status = detection["status"]
+    confidence = detection["confidence"]
+
+    # Tentukan warna berdasarkan status
+    if status == "engaged":
+        color = (0, 255, 0)  # Hijau untuk fokus
+    else:  # compromised
+        color = (0, 0, 255)  # Merah untuk distraksi
+
+    # Gambar bounding box
+    cv2.rectangle(img_cv, (x1, y1), (x2, y2), color, 3)
+
+    # Label
+    label = f"{status.upper()}: {confidence:.2f}"
+
+    # Background untuk text
+    (text_width, text_height), _ = cv2.getTextSize(
+        label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2
+    )
+    cv2.rectangle(img_cv, (x1, y1 - text_height - 15), (x1 + text_width, y1), color, -1)
+
+    # Text
+    cv2.putText(
+        img_cv, label, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2
+    )
+
+    # Convert kembali ke RGB
+    img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(img_rgb)
 
 
 def main():
-    """Main function to run the realtime monitor"""
-    print("🎓 Student Attention Monitor - Realtime Version")
-    print("=" * 50)
-    
-    # Initialize monitor
-    monitor = RealtimeAttentionMonitor(model_path="best.pt", confidence_threshold=0.6)
-    monitor.start_monitoring(camera_index=0)
+    # Header
+    st.markdown(
+        """
+    <div class="header-container">
+        <h1>🎓 Student Engagement Monitoring System</h1>
+        <p><strong>Sistem Monitoring Keterlibatan Siswa dalam Kelas Daring</strong></p>
+    </div>
+    """,
+        unsafe_allow_html=True,
+    )
+
+    # Load model
+    model = load_model()
+    if model is None:
+        st.stop()
+
+    st.success("✅ Model engagement detector berhasil dimuat!")
+
+    # Sidebar pengaturan
+    with st.sidebar:
+        st.header("⚙️ Pengaturan Monitoring")
+        confidence_threshold = st.slider(
+            "Threshold Confidence",
+            min_value=0.3,
+            max_value=0.9,
+            value=0.6,
+            step=0.05,
+            help="Tingkat kepercayaan minimum untuk deteksi",
+        )
+
+        st.markdown("### 📊 Status Pembelajaran")
+        st.markdown("🎯 **FOKUS (Engaged)** - Siswa aktif mengikuti pembelajaran")
+        st.markdown("😴 **DISTRAKSI (Compromised)** - Siswa tidak fokus/mengantuk")
+
+        st.markdown("### 📈 Tips Monitoring")
+        st.info(
+            "• Pastikan pencahayaan yang cukup\n• Posisikan kamera di level mata\n• Hindari background yang ramai"
+        )
+
+    # Pilihan input
+    tab1, tab2, tab3 = st.tabs(
+        ["📷 Monitoring Real-time", "🖼️ Upload Foto", "📊 Statistik"]
+    )
+
+    with tab1:
+        st.header("📷 Monitoring Engagement Real-time")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            start_btn = st.button(
+                "🎥 Mulai Monitoring", type="primary", use_container_width=True
+            )
+        with col2:
+            stop_btn = st.button("⏹️ Stop Monitoring", use_container_width=True)
+        with col3:
+            capture_btn = st.button("📸 Capture Moment", use_container_width=True)
+
+        # Status display
+        status_placeholder = st.empty()
+
+        # Video display
+        video_placeholder = st.empty()
+
+        # Metrics
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            fps_placeholder = st.empty()
+        with col2:
+            confidence_placeholder = st.empty()
+        with col3:
+            engagement_time = st.empty()
+        with col4:
+            timestamp_placeholder = st.empty()
+
+        # Session state untuk webcam
+        if "webcam_running" not in st.session_state:
+            st.session_state.webcam_running = False
+        if "engaged_count" not in st.session_state:
+            st.session_state.engaged_count = 0
+        if "total_count" not in st.session_state:
+            st.session_state.total_count = 0
+
+        if start_btn:
+            st.session_state.webcam_running = True
+            st.session_state.engaged_count = 0
+            st.session_state.total_count = 0
+
+        if stop_btn:
+            st.session_state.webcam_running = False
+
+        # Webcam processing
+        if st.session_state.webcam_running:
+            cap = cv2.VideoCapture(0)
+
+            if not cap.isOpened():
+                st.error("❌ Tidak dapat mengakses webcam. Pastikan kamera tersedia.")
+            else:
+                frame_count = 0
+                start_time = time.time()
+
+                while st.session_state.webcam_running:
+                    ret, frame = cap.read()
+                    if not ret:
+                        st.error("❌ Gagal membaca frame dari webcam")
+                        break
+
+                    # Flip frame untuk mirror effect
+                    frame = cv2.flip(frame, 1)
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pil_image = Image.fromarray(frame_rgb)
+
+                    # Jalankan deteksi
+                    results = model(frame, verbose=False)
+
+                    # Ambil status engagement
+                    detection = get_student_status(results, confidence_threshold)
+
+                    # Gambar hasil deteksi
+                    detected_image = draw_detection(pil_image, detection)
+
+                    # Tampilkan video
+                    video_placeholder.image(
+                        detected_image, channels="RGB", use_container_width=True
+                    )
+
+                    # Update statistik
+                    st.session_state.total_count += 1
+                    if detection and detection["status"] == "engaged":
+                        st.session_state.engaged_count += 1
+
+                    # Update status
+                    if detection:
+                        status_name = detection["status"]
+                        status_conf = detection["confidence"]
+
+                        if status_name in STATUS_CONFIG:
+                            config = STATUS_CONFIG[status_name]
+                            status_placeholder.markdown(
+                                f"""
+                            <div class="status-alert {config['color']}">
+                                {config['emoji']} {config['level']}: {config['description']}
+                                <br>Confidence: {status_conf:.3f}
+                            </div>
+                            """,
+                                unsafe_allow_html=True,
+                            )
+
+                        confidence_placeholder.metric(
+                            "Confidence", f"{status_conf:.3f}"
+                        )
+                    else:
+                        status_placeholder.markdown(
+                            """
+                        <div class="status-alert status-unknown">
+                            🔍 Siswa tidak terdeteksi - Pastikan posisi kamera
+                        </div>
+                        """,
+                            unsafe_allow_html=True,
+                        )
+                        confidence_placeholder.metric("Confidence", "0.000")
+
+                    # Update metrics
+                    frame_count += 1
+                    elapsed = time.time() - start_time
+                    if elapsed > 0:
+                        fps = frame_count / elapsed
+                        fps_placeholder.metric("FPS", f"{fps:.1f}")
+
+                    # Engagement rate
+                    if st.session_state.total_count > 0:
+                        engagement_rate = (
+                            st.session_state.engaged_count
+                            / st.session_state.total_count
+                        ) * 100
+                        engagement_time.metric("Engagement", f"{engagement_rate:.1f}%")
+
+                    timestamp_placeholder.metric("Waktu", time.strftime("%H:%M:%S"))
+
+                    # Capture frame jika diminta
+                    if capture_btn:
+                        timestamp = int(time.time())
+                        filename = f"student_capture_{timestamp}.jpg"
+                        detected_image.save(filename)
+                        st.success(f"📸 Screenshot tersimpan: {filename}")
+
+                    time.sleep(0.03)  # ~30 FPS
+
+                cap.release()
+
+    with tab2:
+        st.header("🖼️ Analisis Foto Siswa")
+
+        uploaded_file = st.file_uploader(
+            "Upload foto siswa untuk analisis engagement",
+            type=["jpg", "jpeg", "png"],
+            help="Upload foto siswa saat mengikuti kelas daring",
+        )
+
+        if uploaded_file is not None:
+            # Load gambar
+            image = Image.open(uploaded_file)
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.subheader("📷 Foto Asli")
+                st.image(image, use_container_width=True)
+
+            # Jalankan deteksi
+            with st.spinner("🔄 Menganalisis engagement siswa..."):
+                results = model(image, verbose=False)
+                detection = get_student_status(results, confidence_threshold)
+                detected_image = draw_detection(image, detection)
+
+            with col2:
+                st.subheader("🎯 Hasil Analisis")
+                st.image(detected_image, use_container_width=True)
+
+            # Tampilkan hasil analisis
+            if detection:
+                status_name = detection["status"]
+                status_conf = detection["confidence"]
+
+                if status_name in STATUS_CONFIG:
+                    config = STATUS_CONFIG[status_name]
+                    st.markdown(
+                        f"""
+                    <div class="status-alert {config['color']}">
+                        {config['emoji']} STATUS: {config['level']}
+                        <br>{config['description']}
+                        <br>Confidence: {status_conf:.3f}
+                    </div>
+                    """,
+                        unsafe_allow_html=True,
+                    )
+
+                # Rekomendasi berdasarkan status
+                st.subheader("💡 Rekomendasi untuk Pembelajaran")
+                if status_name == "engaged":
+                    st.success(
+                        "🎯 Excellent! Siswa menunjukkan engagement yang baik dalam pembelajaran. Pertahankan metode pembelajaran ini."
+                    )
+                    st.info(
+                        "📝 Tips: Berikan pujian dan variasi aktivitas untuk mempertahankan engagement."
+                    )
+                elif status_name == "compromised":
+                    st.error("😴 Perhatian! Siswa tampak tidak fokus atau mengantuk.")
+                    st.warning("📝 Saran:")
+                    st.write("• Lakukan ice breaking atau energizer")
+                    st.write("• Ajukan pertanyaan interaktif")
+                    st.write("• Gunakan metode pembelajaran yang lebih engaging")
+                    st.write("• Cek apakah siswa memerlukan istirahat")
+
+            else:
+                st.info(
+                    "ℹ️ Tidak dapat mendeteksi status engagement dengan confidence yang cukup tinggi. Pastikan wajah siswa terlihat jelas."
+                )
+
+    with tab3:
+        st.header("📊 Statistik Engagement")
+
+        if "total_count" in st.session_state and st.session_state.total_count > 0:
+            col1, col2, col3 = st.columns(3)
+
+            engagement_rate = (
+                st.session_state.engaged_count / st.session_state.total_count
+            ) * 100
+            distraction_rate = 100 - engagement_rate
+
+            with col1:
+                st.metric("Total Deteksi", st.session_state.total_count)
+            with col2:
+                st.metric(
+                    "Engagement Rate",
+                    f"{engagement_rate:.1f}%",
+                    delta=f"+{st.session_state.engaged_count}",
+                )
+            with col3:
+                st.metric("Distraction Rate", f"{distraction_rate:.1f}%")
+
+            # Progress bar
+            st.subheader("📈 Tingkat Engagement")
+            st.progress(engagement_rate / 100)
+
+            # Interpretasi
+            if engagement_rate >= 80:
+                st.success("🏆 Excellent! Tingkat engagement sangat baik.")
+            elif engagement_rate >= 60:
+                st.info("👍 Good! Tingkat engagement cukup baik.")
+            elif engagement_rate >= 40:
+                st.warning("⚠️ Moderate. Perlu peningkatan engagement.")
+            else:
+                st.error(
+                    "🚨 Poor. Diperlukan intervensi untuk meningkatkan engagement."
+                )
+        else:
+            st.info("📊 Mulai monitoring untuk melihat statistik engagement.")
+            st.markdown("### 📋 Cara Menggunakan:")
+            st.write("1. Klik tab 'Monitoring Real-time'")
+            st.write("2. Klik 'Mulai Monitoring'")
+            st.write("3. Biarkan sistem menganalisis engagement siswa")
+            st.write("4. Kembali ke tab ini untuk melihat statistik")
+
+
+if __name__ == "__main__":
+    main()
