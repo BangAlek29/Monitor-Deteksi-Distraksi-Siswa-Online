@@ -4,8 +4,6 @@ import numpy as np
 from ultralytics import YOLO
 from PIL import Image
 import time
-import base64
-from io import BytesIO
 
 # Konfigurasi halaman
 st.set_page_config(
@@ -50,11 +48,18 @@ st.markdown(
         border: 3px solid #2563EB;
     }
     
+    .status-standby { 
+        background: linear-gradient(135deg, #8B5CF6, #A78BFA);
+        color: white;
+        border: 3px solid #7C3AED;
+    }
+    
     .webcam-container {
         background: #f8f9fa;
         border-radius: 1rem;
         padding: 1rem;
         border: 2px solid #e9ecef;
+        text-align: center;
     }
     
     .metric-grid {
@@ -91,33 +96,21 @@ st.markdown(
         margin-bottom: 2rem;
     }
     
-    .control-button {
-        width: 100%;
-        padding: 0.8rem;
-        margin: 0.5rem 0;
-        border-radius: 0.5rem;
-        border: none;
-        font-weight: bold;
-        cursor: pointer;
-        transition: all 0.3s ease;
-    }
-    
-    .btn-start {
-        background: #10B981;
-        color: white;
-    }
-    
-    .btn-stop {
-        background: #EF4444;
-        color: white;
-    }
-    
     .instructions {
         background: #f0f9ff;
         border: 1px solid #0ea5e9;
         border-radius: 0.8rem;
         padding: 1.5rem;
         margin: 1rem 0;
+    }
+    
+    .camera-info {
+        background: #fef3c7;
+        border: 1px solid #f59e0b;
+        border-radius: 0.8rem;
+        padding: 1rem;
+        margin: 1rem 0;
+        text-align: center;
     }
 </style>
 """,
@@ -156,9 +149,9 @@ def load_model():
 
 def classify_attention(results, confidence_threshold=0.5):
     """Klasifikasi tingkat perhatian siswa berdasarkan deteksi"""
-    # Logika sederhana: deteksi wajah = engaged, tidak ada deteksi = compromised
     person_detected = False
     max_confidence = 0
+    face_detected = False
 
     for result in results:
         boxes = result.boxes
@@ -172,51 +165,66 @@ def classify_attention(results, confidence_threshold=0.5):
                     person_detected = True
                     max_confidence = max(max_confidence, confidence)
 
-    if person_detected:
+                    # Jika deteksi person dengan confidence tinggi, anggap sebagai engaged
+                    if confidence > 0.7:
+                        face_detected = True
+
+    if person_detected and face_detected:
+        return {"status": "Engaged", "confidence": max_confidence, "detected": True}
+    elif person_detected:
         return {"status": "Engaged", "confidence": max_confidence, "detected": True}
     else:
         return {"status": "Compromised", "confidence": 0.0, "detected": False}
 
 
-def create_camera_interface():
-    """Buat interface kamera yang simpel"""
-    st.markdown(
-        """
-    <script>
-    async function startCamera() {
-        try {
-            const video = document.getElementById('webcam');
-            const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-            video.srcObject = stream;
-            video.play();
-        } catch (err) {
-            console.error('Error accessing camera:', err);
-            alert('Tidak dapat mengakses kamera. Pastikan izin kamera telah diberikan.');
-        }
-    }
-    
-    function stopCamera() {
-        const video = document.getElementById('webcam');
-        if (video.srcObject) {
-            video.srcObject.getTracks().forEach(track => track.stop());
-            video.srcObject = null;
-        }
-    }
-    </script>
-    
-    <div class="webcam-container">
-        <video id="webcam" width="100%" height="400" style="border-radius: 0.5rem; background: #000;"></video>
-        <div style="text-align: center; margin-top: 1rem;">
-            <button onclick="startCamera()" class="control-button btn-start">🎥 Mulai Monitoring</button>
-            <button onclick="stopCamera()" class="control-button btn-stop">⏹️ Stop Monitoring</button>
-        </div>
-    </div>
-    """,
-        unsafe_allow_html=True,
-    )
+def draw_detection_boxes(image, results, confidence_threshold=0.5):
+    """Gambar bounding box pada deteksi"""
+    img_array = np.array(image)
+
+    for result in results:
+        boxes = result.boxes
+        if boxes is not None:
+            for box in boxes:
+                confidence = float(box.conf[0])
+                class_id = int(box.cls[0])
+
+                if confidence >= confidence_threshold:
+                    # Koordinat bounding box
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                    # Warna berdasarkan class
+                    if class_id == 0:  # person
+                        color = (0, 255, 0) if confidence > 0.7 else (255, 255, 0)
+                    else:
+                        color = (255, 0, 0)
+
+                    # Gambar rectangle
+                    cv2.rectangle(img_array, (x1, y1), (x2, y2), color, 2)
+
+                    # Label
+                    label = f"Person: {confidence:.2f}"
+                    cv2.putText(
+                        img_array,
+                        label,
+                        (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        color,
+                        2,
+                    )
+
+    return Image.fromarray(img_array)
 
 
 def main():
+    # Initialize session state
+    if "focus_sessions" not in st.session_state:
+        st.session_state.focus_sessions = 0
+    if "start_time" not in st.session_state:
+        st.session_state.start_time = None
+    if "last_status" not in st.session_state:
+        st.session_state.last_status = "Standby"
+
     # Header
     st.markdown(
         """
@@ -239,48 +247,83 @@ def main():
     with col1:
         st.markdown("### 📷 Live Camera Feed")
 
-        # Instruksi penggunaan
-        st.markdown(
-            """
-        <div class="instructions">
-            <h4>📋 Cara Penggunaan:</h4>
-            <ol>
-                <li>Klik tombol "Mulai Monitoring" untuk mengaktifkan kamera</li>
-                <li>Pastikan wajah Anda terlihat jelas di kamera</li>
-                <li>Sistem akan mendeteksi apakah Anda fokus atau tidak</li>
-                <li>Status akan ditampilkan secara real-time</li>
-            </ol>
-        </div>
-        """,
-            unsafe_allow_html=True,
-        )
+        # Webcam input menggunakan Streamlit
+        camera_input = st.camera_input("📸 Ambil foto untuk monitoring")
 
-        # Interface kamera
-        camera_placeholder = st.empty()
+        if camera_input is not None:
+            # Convert uploaded image
+            image = Image.open(camera_input)
 
-        # Simulasi interface kamera web-based
-        with camera_placeholder.container():
+            # Jalankan deteksi
+            with st.spinner("🔄 Analyzing..."):
+                results = model(image, verbose=False)
+                detection = classify_attention(results, confidence_threshold=0.6)
+
+                # Gambar bounding box
+                processed_image = draw_detection_boxes(
+                    image, results, confidence_threshold=0.6
+                )
+
+            # Tampilkan hasil
+            col_img1, col_img2 = st.columns(2)
+
+            with col_img1:
+                st.markdown("**📷 Original**")
+                st.image(image, use_container_width=True)
+
+            with col_img2:
+                st.markdown("**🎯 Detection Result**")
+                st.image(processed_image, use_container_width=True)
+
+            # Update status
+            status = detection["status"]
+            config = STATUS_CONFIG[status]
+
+            # Update session tracking
+            if st.session_state.last_status != status:
+                if status == "Engaged":
+                    st.session_state.focus_sessions += 1
+                st.session_state.last_status = status
+
+            if st.session_state.start_time is None:
+                st.session_state.start_time = time.time()
+
+            # Display status
+            st.markdown(
+                f"""
+            <div class="status-card {config['color']}">
+                {config['emoji']} {config['level']}
+                <br><small>{config['message']}</small>
+                <br><small>Confidence: {detection['confidence']:.3f}</small>
+            </div>
+            """,
+                unsafe_allow_html=True,
+            )
+
+        else:
+            # Instruksi penggunaan
             st.markdown(
                 """
-            <div class="webcam-container">
-                <div style="background: #1a1a1a; height: 400px; border-radius: 0.5rem; display: flex; align-items: center; justify-content: center; color: white; flex-direction: column;">
-                    <div style="font-size: 4rem; margin-bottom: 1rem;">📹</div>
-                    <h3>Camera Feed Area</h3>
-                    <p>Kamera akan aktif saat di-deploy di web</p>
-                    <p style="font-size: 0.9rem; opacity: 0.7;">Demo: Upload gambar di panel sebelah kanan</p>
-                </div>
-                <div style="text-align: center; margin-top: 1rem;">
-                    <div style="display: inline-block; margin: 0 0.5rem;">
-                        <button style="background: #10B981; color: white; padding: 0.8rem 2rem; border: none; border-radius: 0.5rem; font-weight: bold; cursor: pointer;">
-                            🎥 Mulai Monitoring
-                        </button>
-                    </div>
-                    <div style="display: inline-block; margin: 0 0.5rem;">
-                        <button style="background: #EF4444; color: white; padding: 0.8rem 2rem; border: none; border-radius: 0.5rem; font-weight: bold; cursor: pointer;">
-                            ⏹️ Stop Monitoring
-                        </button>
-                    </div>
-                </div>
+            <div class="instructions">
+                <h4>📋 Cara Penggunaan:</h4>
+                <ol>
+                    <li>Klik tombol "Take Photo" di atas untuk mengaktifkan kamera</li>
+                    <li>Posisikan wajah Anda di depan kamera</li>
+                    <li>Tekan tombol untuk mengambil foto</li>
+                    <li>Sistem akan menganalisis tingkat perhatian Anda</li>
+                    <li>Ulangi proses untuk monitoring berkelanjutan</li>
+                </ol>
+            </div>
+            """,
+                unsafe_allow_html=True,
+            )
+
+            st.markdown(
+                """
+            <div class="camera-info">
+                <h4>📷 Camera Ready</h4>
+                <p>Klik tombol "Take Photo" untuk memulai monitoring</p>
+                <p>Pastikan pencahayaan cukup dan wajah terlihat jelas</p>
             </div>
             """,
                 unsafe_allow_html=True,
@@ -308,8 +351,16 @@ def main():
         """
         )
 
-        # Demo upload untuk testing
-        st.markdown("### 🖼️ Test Upload")
+        # Reset button
+        if st.button("🔄 Reset Session", use_container_width=True):
+            st.session_state.focus_sessions = 0
+            st.session_state.start_time = None
+            st.session_state.last_status = "Standby"
+            st.success("Session direset!")
+            st.rerun()
+
+        # File upload untuk testing
+        st.markdown("### 🖼️ Upload Test Image")
         uploaded_file = st.file_uploader(
             "Upload foto untuk testing",
             type=["jpg", "jpeg", "png"],
@@ -338,32 +389,43 @@ def main():
                 unsafe_allow_html=True,
             )
 
-    # Status display area
+    # Status display area dan metrics
     st.markdown("---")
     status_col1, status_col2 = st.columns([1, 1])
 
     with status_col1:
-        st.markdown(
-            """
-        <div class="status-card status-monitoring">
-            🔍 SISTEM STANDBY
-            <br><small>Menunggu aktivasi kamera...</small>
-        </div>
-        """,
-            unsafe_allow_html=True,
-        )
+        if camera_input is not None or uploaded_file is not None:
+            # Menampilkan status terkini
+            pass  # Status sudah ditampilkan di atas
+        else:
+            st.markdown(
+                """
+            <div class="status-card status-standby">
+                🔍 SISTEM STANDBY
+                <br><small>Menunggu input kamera...</small>
+            </div>
+            """,
+                unsafe_allow_html=True,
+            )
 
     with status_col2:
         # Metrics
+        if st.session_state.start_time:
+            elapsed_time = int(time.time() - st.session_state.start_time)
+            minutes, seconds = divmod(elapsed_time, 60)
+            time_str = f"{minutes:02d}:{seconds:02d}"
+        else:
+            time_str = "00:00"
+
         st.markdown(
-            """
+            f"""
         <div class="metric-grid">
             <div class="metric-item">
-                <div class="metric-value">0</div>
+                <div class="metric-value">{st.session_state.focus_sessions}</div>
                 <div class="metric-label">Sesi Fokus</div>
             </div>
             <div class="metric-item">
-                <div class="metric-value">00:00</div>
+                <div class="metric-value">{time_str}</div>
                 <div class="metric-label">Waktu Monitoring</div>
             </div>
         </div>
@@ -375,15 +437,22 @@ def main():
     st.markdown("---")
     st.markdown(
         """
-    <div style="text-align: center; color: #6b7280; padding: 2rem;">
-        <h4>💡 Informasi Deployment</h4>
-        <p>Untuk deployment di web:</p>
-        <ul style="text-align: left; max-width: 600px; margin: 0 auto;">
-            <li>Gunakan Streamlit Cloud, Heroku, atau platform hosting lainnya</li>
-            <li>Pastikan requirements.txt berisi: streamlit, opencv-python-headless, ultralytics, pillow</li>
-            <li>Upload model YOLO (best.pt) ke repository</li>
-            <li>Kamera akan otomatis terakses melalui browser</li>
-        </ul>
+    <div style="text-align: center; color: #6b7280; padding: 1rem;">
+        <h4>💡 Tips Penggunaan</h4>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem; max-width: 800px; margin: 0 auto;">
+            <div style="background: #f9fafb; padding: 1rem; border-radius: 0.5rem;">
+                <strong>📷 Kamera</strong><br>
+                Pastikan pencahayaan cukup dan wajah terlihat jelas
+            </div>
+            <div style="background: #f9fafb; padding: 1rem; border-radius: 0.5rem;">
+                <strong>🎯 Posisi</strong><br>
+                Posisikan wajah di tengah frame kamera
+            </div>
+            <div style="background: #f9fafb; padding: 1rem; border-radius: 0.5rem;">
+                <strong>⏱️ Monitoring</strong><br>
+                Ambil foto secara berkala untuk tracking yang akurat
+            </div>
+        </div>
     </div>
     """,
         unsafe_allow_html=True,
