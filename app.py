@@ -139,7 +139,7 @@ def load_model():
     """Load YOLO model"""
     try:
         # Gunakan model YOLOv8 default atau model custom Anda
-        model = YOLO("yolov8n.pt")  # Ganti dengan "best.pt" jika ada model custom
+        model = YOLO("best.pt")  # Ganti dengan "best.pt" jika ada model custom
         return model
     except Exception as e:
         st.error(f"❌ Error loading model: {e}")
