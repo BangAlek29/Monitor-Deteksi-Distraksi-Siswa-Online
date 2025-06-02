@@ -4,44 +4,41 @@ import numpy as np
 from ultralytics import YOLO
 from PIL import Image
 import time
+from streamlit_webrtc import (
+    webrtc_streamer,
+    VideoTransformerBase,
+    RTCConfiguration,
+    WebRtcMode,
+)
 
-# Konfigurasi halaman
+# --- Konfigurasi Halaman dan CSS ---
 st.set_page_config(
     page_title="Monitor Deteksi Distraksi Siswa",
-    page_icon="🧑‍🎓",  # Ikon diubah
+    page_icon="🧑‍🎓",
     layout="centered",
 )
 
-# CSS untuk styling (tetap sama, sudah cukup baik)
 st.markdown(
     """
 <style>
     .status-alert {
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 1rem 0;
-        font-weight: bold;
-        text-align: center;
-        font-size: 1.2rem;
+        padding: 1rem; border-radius: 0.5rem; margin: 1rem 0;
+        font-weight: bold; text-align: center; font-size: 1.2rem;
     }
     .status-normal { background-color: #d4edda; color: #155724; border: 2px solid #c3e6cb; }
     .status-engaged { background-color: #cce5ff; color: #004085; border: 2px solid #99d6ff; }
     .status-warning { background-color: #fff3cd; color: #856404; border: 2px solid #ffeaa7; }
     .status-danger { background-color: #f8d7da; color: #721c24; border: 2px solid #f5c6cb; }
-    
     .metric-card {
-        background: #f8f9fa;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border: 1px solid #dee2e6;
-        text-align: center;
+        background: #f8f9fa; padding: 1rem; border-radius: 0.5rem;
+        border: 1px solid #dee2e6; text-align: center;
     }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# Mapping status dan warna - Disesuaikan untuk siswa
+# --- Konfigurasi Status ---
 STATUS_CONFIG = {
     "Normal": {"color": "status-normal", "emoji": "✅", "level": "FOKUS"},
     "Engaged": {"color": "status-engaged", "emoji": "👀", "level": "AKTIF BELAJAR"},
@@ -49,7 +46,7 @@ STATUS_CONFIG = {
     "Compromised": {
         "color": "status-danger",
         "emoji": "🚨",
-        "level": "PERLU PERHATIAN",  # Diubah dari BAHAYA
+        "level": "PERLU PERHATIAN",
     },
     "Face Covered": {
         "color": "status-warning",
@@ -68,304 +65,299 @@ STATUS_CONFIG = {
     },
     "Object Detected": {
         "color": "status-warning",
-        "emoji": "📱",  # Bisa berarti HP atau objek lain
+        "emoji": "📱",
         "level": "OBJEK TERDETEKSI",
     },
 }
 
 
+# --- Fungsi Model dan Deteksi ---
 @st.cache_resource
-def load_model():
-    """Load YOLO model"""
+def load_yolo_model():
     try:
-        model = YOLO(
-            "best.pt"
-        )  # Pastikan file best.pt ada di direktori yang sama atau berikan path lengkap
+        model = YOLO("best.pt")
         return model
     except Exception as e:
-        st.error(f"❌ Error loading model: {e}")
+        st.error(f"❌ Error loading model 'best.pt': {e}")
         return None
 
 
+MODEL = load_yolo_model()
+
+
 def get_detection_status(results, confidence_threshold=0.5):
-    """Ambil status deteksi dengan confidence tertinggi"""
     best_detection = None
     max_confidence = 0
-
-    for result in results:
-        boxes = result.boxes
-        if boxes is not None:
-            for box in boxes:
-                confidence = float(box.conf[0])
-                if confidence >= confidence_threshold and confidence > max_confidence:
-                    class_id = int(box.cls[0])
-                    class_name = result.names[class_id]
-                    max_confidence = confidence
-                    best_detection = {
-                        "class": class_name,
-                        "confidence": confidence,
-                        "bbox": box.xyxy[0].tolist(),
-                    }
+    if results:  # Memastikan results tidak None atau kosong
+        for result in results:
+            boxes = result.boxes
+            if boxes is not None:
+                for box in boxes:
+                    confidence = float(box.conf[0])
+                    if (
+                        confidence >= confidence_threshold
+                        and confidence > max_confidence
+                    ):
+                        class_id = int(box.cls[0])
+                        class_name = result.names[class_id]
+                        max_confidence = confidence
+                        best_detection = {
+                            "class": class_name,
+                            "confidence": confidence,
+                            "bbox": box.xyxy[0].tolist(),
+                        }
     return best_detection
 
 
-def draw_detection(image, detection):
-    """Gambar bounding box pada gambar"""
-    if detection is None:
-        return image
+def draw_bounding_box(image_pil, detection_info):
+    if detection_info is None:
+        return image_pil
 
-    img_array = np.array(image.convert("RGB"))
-    img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+    img_array_rgb = np.array(image_pil.convert("RGB"))
+    img_cv_bgr = cv2.cvtColor(img_array_rgb, cv2.COLOR_RGB2BGR)
 
-    x1, y1, x2, y2 = map(int, detection["bbox"])
-    class_name = detection["class"]
-    confidence = detection["confidence"]
+    x1, y1, x2, y2 = map(int, detection_info["bbox"])
+    class_name = detection_info["class"]
+    confidence = detection_info["confidence"]
 
-    # Tentukan warna berdasarkan status dari STATUS_CONFIG
-    status_info = STATUS_CONFIG.get(
-        class_name, {"color": "status-normal"}
-    )  # Default ke normal jika tidak ada
+    color_map = {
+        "Normal": (0, 255, 0),
+        "Engaged": (0, 255, 0),  # Hijau
+        "Distracted": (0, 165, 255),
+        "Face Covered": (0, 165, 255),  # Oranye
+        "Face Concealed": (0, 165, 255),
+        "Face Not Visible": (0, 165, 255),
+        "Object Detected": (0, 165, 255),
+        "Compromised": (0, 0, 255),  # Merah
+    }
+    box_color = color_map.get(class_name, (255, 0, 0))  # Default Biru
 
-    # Ambil warna BGR dari hex (misalnya, #d4edda -> (218, 237, 212)) atau definisikan secara manual
-    # Untuk simple, kita gunakan logika warna yang sudah ada
-    if class_name in ["Normal", "Engaged"]:
-        box_color = (0, 255, 0)  # Hijau
-    elif (
-        class_name in STATUS_CONFIG
-        and STATUS_CONFIG[class_name]["color"] == "status-warning"
-    ):
-        box_color = (0, 165, 255)  # Orange
-    elif (
-        class_name in STATUS_CONFIG
-        and STATUS_CONFIG[class_name]["color"] == "status-danger"
-    ):
-        box_color = (0, 0, 255)  # Merah
-    else:
-        box_color = (255, 0, 0)  # Biru untuk default jika tidak termapping
-
-    cv2.rectangle(img_cv, (x1, y1), (x2, y2), box_color, 3)
+    cv2.rectangle(
+        img_cv_bgr, (x1, y1), (x2, y2), box_color, 2
+    )  # Ketebalan garis diubah ke 2
     label = f"{class_name}: {confidence:.2f}"
     (text_width, text_height), _ = cv2.getTextSize(
-        label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
-    )
+        label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1
+    )  # Ukuran font diubah
     cv2.rectangle(
-        img_cv,
-        (x1, y1 - text_height - 15),
-        (x1 + text_width, y1 - 5),  # Disesuaikan sedikit agar pas
+        img_cv_bgr,
+        (x1, y1 - text_height - 10),
+        (x1 + text_width, y1 - 5),
         box_color,
         -1,
     )
     cv2.putText(
-        img_cv,
+        img_cv_bgr,
         label,
-        (x1, y1 - 10),
+        (x1, y1 - 7),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
+        0.6,
         (255, 255, 255),
-        2,
+        1,
     )
-    img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(img_rgb)
+
+    img_array_processed_rgb = cv2.cvtColor(img_cv_bgr, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(img_array_processed_rgb)
 
 
-def main():
-    # Header
+# --- Video Transformer untuk streamlit-webrtc ---
+class YOLOVideoTransformer(VideoTransformerBase):
+    def __init__(self, confidence_threshold_val):
+        self.confidence_threshold = confidence_threshold_val
+        self.model = MODEL  # Gunakan model yang sudah di-load global
+        self.latest_detection_info = {
+            "status_name": "Inisialisasi...",
+            "status_conf_val": 0.0,
+            "status_level": "MEMUAT",
+            "status_emoji": "🔄",
+            "status_color_class": "status-normal",  # Warna CSS class
+            "fps": 0.0,
+        }
+        self._frame_count_for_fps = 0
+        self._start_time_for_fps = time.time()
+
+    def update_fps(self):
+        self._frame_count_for_fps += 1
+        elapsed_time = time.time() - self._start_time_for_fps
+        if elapsed_time > 1.0:  # Update FPS kira-kira setiap 1 detik
+            self.latest_detection_info["fps"] = self._frame_count_for_fps / elapsed_time
+            self._frame_count_for_fps = 0
+            self._start_time_for_fps = time.time()
+
+    def recv(self, frame):
+        img_bgr = frame.to_ndarray(format="bgr24")
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil_image_input = Image.fromarray(img_rgb)
+
+        detection_result = None
+        processed_pil_image = pil_image_input  # Default jika model tidak ada
+
+        if self.model:
+            results = self.model(
+                pil_image_input, verbose=False, half=True
+            )  # Menggunakan pil_image_input
+            detection_result = get_detection_status(results, self.confidence_threshold)
+            processed_pil_image = draw_bounding_box(pil_image_input, detection_result)
+
+        # Update info deteksi terakhir
+        if detection_result:
+            class_name = detection_result["class"]
+            conf_val = detection_result["confidence"]
+            self.latest_detection_info["status_name"] = class_name
+            self.latest_detection_info["status_conf_val"] = conf_val
+            if class_name in STATUS_CONFIG:
+                config = STATUS_CONFIG[class_name]
+                self.latest_detection_info["status_level"] = config["level"]
+                self.latest_detection_info["status_emoji"] = config["emoji"]
+                self.latest_detection_info["status_color_class"] = config["color"]
+            else:  # Kelas tidak dikenal
+                self.latest_detection_info["status_level"] = "TIDAK DIKENAL"
+                self.latest_detection_info["status_emoji"] = "❓"
+                self.latest_detection_info["status_color_class"] = "status-warning"
+        else:
+            self.latest_detection_info["status_name"] = "Tidak Ada Deteksi"
+            self.latest_detection_info["status_conf_val"] = 0.0
+            self.latest_detection_info["status_level"] = "STANDBY"
+            self.latest_detection_info["status_emoji"] = "☕"
+            self.latest_detection_info["status_color_class"] = "status-normal"
+
+        self.update_fps()
+
+        img_out_rgb = np.array(processed_pil_image.convert("RGB"))
+        img_out_bgr = cv2.cvtColor(img_out_rgb, cv2.COLOR_RGB2BGR)
+        return frame.from_ndarray(img_out_bgr, format="bgr24")
+
+
+# --- Aplikasi Streamlit Utama ---
+def main_app():
     st.title("🧑‍🎓 Monitor Deteksi Distraksi Siswa")
-    st.markdown("**Pantau fokus belajarmu secara real-time!**")
     st.markdown(
-        "Aplikasi ini membantu mendeteksi tingkat fokus menggunakan kamera saat kamu belajar online (misalnya via Google Meet, Zoom, dll)."
+        "**Pantau fokus belajarmu secara real-time!** Aplikasi ini membantu mendeteksi tingkat fokus saat belajar online."
     )
     st.markdown("---")
 
-    model = load_model()
-    if model is None:
-        st.warning(
-            "Model tidak dapat dimuat. Pastikan file 'best.pt' ada di direktori aplikasi."
-        )
+    if MODEL is None:
+        st.error("❌ Model pendeteksi gagal dimuat. Aplikasi tidak dapat berjalan.")
         st.stop()
-
     st.success("✅ Model pendeteksi berhasil dimuat!")
 
+    # --- Sidebar ---
     with st.sidebar:
         st.header("⚙️ Pengaturan")
-        confidence_threshold = st.slider(
+        confidence_threshold_slider = st.slider(
             "Ambang Batas Kepercayaan (Confidence)",
-            min_value=0.3,
-            max_value=0.9,
-            value=0.6,
-            step=0.05,
-            help="Semakin tinggi nilainya, model akan semakin selektif dalam mendeteksi.",
+            0.3,
+            0.9,
+            0.6,
+            0.05,
+            help="Semakin tinggi, deteksi semakin selektif.",
         )
         st.markdown("---")
         st.markdown("### 📊 Legenda Status")
-        for status_name, config in STATUS_CONFIG.items():
-            st.markdown(f"{config['emoji']} **{status_name}** - {config['level']}")
+        for status_key, config_val in STATUS_CONFIG.items():
+            st.markdown(
+                f"{config_val['emoji']} **{status_key}** - {config_val['level']}"
+            )
         st.markdown("---")
-        st.info(
-            "Aplikasi ini menggunakan model YOLO untuk deteksi. Akurasi dapat bervariasi."
+        st.info("Webcam diakses via browser Anda. Izinkan akses jika diminta.")
+
+    # --- Tabs ---
+    tab_webcam, tab_upload = st.tabs(["📷 Kamera Real-time", "🖼️ Unggah Gambar"])
+
+    # --- Tab 1: Kamera Real-time ---
+    with tab_webcam:
+        st.header("🎥 Monitoring Real-time via Kamera")
+        st.write(
+            "Klik 'START' di bawah untuk mengaktifkan kamera Anda. Izinkan akses di browser jika diminta."
         )
 
-    tab1, tab2 = st.tabs(
-        ["📷 Kamera Real-time", "🖼️ Unggah Gambar"]
-    )  # Mengubah ikon tab 1
+        # Placeholders untuk metrik yang diupdate dari transformer
+        status_col, conf_col, fps_col, time_col = st.columns(4)
+        ui_status_placeholder = status_col.empty()
+        ui_confidence_placeholder = conf_col.empty()
+        ui_fps_placeholder = fps_col.empty()
+        ui_timestamp_placeholder = time_col.empty()
 
-    with tab1:
-        st.header("📷 Monitoring Real-time via Kamera")
-        st.write("Nyalakan kameramu dan lihat status fokusmu!")
+        # Inisialisasi placeholder dengan nilai default
+        ui_status_placeholder.markdown(
+            f"""<div class="status-alert status-normal">🔄 Menunggu Kamera...</div>""",
+            unsafe_allow_html=True,
+        )
+        ui_confidence_placeholder.metric("Kepercayaan", "N/A")
+        ui_fps_placeholder.metric("FPS", "N/A")
+        ui_timestamp_placeholder.metric("Waktu", time.strftime("%H:%M:%S"))
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            start_btn = st.button(
-                "🎥 Mulai Monitoring", type="primary", use_container_width=True
+        rtc_config = RTCConfiguration(
+            {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+        )
+
+        # Factory untuk membuat instance transformer dengan confidence threshold terbaru
+        def video_transformer_factory():
+            return YOLOVideoTransformer(
+                confidence_threshold_val=confidence_threshold_slider
             )
-        with col2:
-            stop_btn = st.button("⏹️ Stop Monitoring", use_container_width=True)
-        with col3:
-            capture_btn_clicked = st.button(
-                "📸 Info Frame",
-                use_container_width=True,
-                help="Menampilkan info frame saat ini (tidak menyimpan gambar).",
-            )
 
-        status_placeholder = st.empty()
-        video_placeholder = st.empty()
+        webrtc_ctx = webrtc_streamer(
+            key="student-distraction-monitor",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=rtc_config,
+            video_transformer_factory=video_transformer_factory,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+            # desired_playing_state=st.session_state.get("play_webrtc", False) # Jika ingin kontrol manual Start/Stop
+        )
 
-        st.markdown("---")
-        st.subheader("📈 Metrik Deteksi")
-        metric_col1, metric_col2, metric_col3 = st.columns(3)
-        with metric_col1:
-            fps_placeholder = st.empty()
-        with metric_col2:
-            confidence_display_placeholder = st.empty()
-        with metric_col3:
-            timestamp_placeholder = st.empty()
+        # Tombol info (opsional, untuk debug atau info cepat)
+        # if st.button("ℹ️ Info Deteksi Terakhir (Webcam)", use_container_width=True):
+        #     if webrtc_ctx.video_transformer:
+        #         info = webrtc_ctx.video_transformer.latest_detection_info
+        #         st.toast(f"Status: {info['status_name']} ({info['status_level']}) @ {info['status_conf_val']:.2f} | FPS: {info['fps']:.1f}", icon=info['status_emoji'])
+        #     else:
+        #         st.toast("Kamera belum aktif atau transformer belum siap.", icon="⏳")
 
-        if "webcam_running" not in st.session_state:
-            st.session_state.webcam_running = False
-
-        if start_btn:
-            st.session_state.webcam_running = True
-            st.toast("Kamera sedang dimulai...", icon="📸")  # Mengganti ikon toast
-
-        if stop_btn:
-            st.session_state.webcam_running = False
-            st.toast("Monitoring dihentikan.", icon="🛑")
-
-        if st.session_state.webcam_running:
-            cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
-                st.error(
-                    "❌ Webcam tidak terdeteksi. Pastikan terhubung dan tidak digunakan aplikasi lain."
+        # Loop untuk update UI dari transformer jika sedang berjalan
+        if webrtc_ctx.state.playing and webrtc_ctx.video_transformer:
+            while True:  # Loop ini akan berjalan selama webrtc aktif
+                info = webrtc_ctx.video_transformer.latest_detection_info
+                ui_status_placeholder.markdown(
+                    f"""
+                    <div class="status-alert {info['status_color_class']}">
+                        {info['status_emoji']} {info['status_level']} ({info['status_name']})
+                        <br>Kepercayaan: {info['status_conf_val']:.2f}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
-                st.session_state.webcam_running = (
-                    False  # Hentikan jika tidak bisa buka webcam
+                ui_confidence_placeholder.metric(
+                    "Kepercayaan",
+                    (
+                        f"{info['status_conf_val']:.3f}"
+                        if info["status_conf_val"] > 0
+                        else "N/A"
+                    ),
                 )
-            else:
-                frame_count = 0
-                start_time = time.time()
-                while st.session_state.webcam_running:
-                    ret, frame = cap.read()
-                    if not ret:
-                        st.warning(
-                            "⚠️ Gagal membaca frame. Mencoba lagi..."
-                        )  # Mengganti ikon warning
-                        cap.release()
-                        time.sleep(0.5)
-                        cap = cv2.VideoCapture(0)
-                        if not cap.isOpened():
-                            st.error("❌ Gagal menghubungkan kembali webcam.")
-                            st.session_state.webcam_running = False
-                            break
-                        continue
+                ui_fps_placeholder.metric("FPS", f"{info['fps']:.1f}")
+                ui_timestamp_placeholder.metric("Waktu", time.strftime("%H:%M:%S"))
 
-                    frame = cv2.flip(frame, 1)
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    pil_image = Image.fromarray(frame_rgb)
-
-                    results = model(frame_rgb, verbose=False)
-                    detection = get_detection_status(results, confidence_threshold)
-                    detected_image = draw_detection(pil_image, detection)
-
-                    video_placeholder.image(
-                        detected_image, channels="RGB", use_container_width=True
+                # Periksa apakah streaming masih berjalan, jika tidak, keluar dari loop update UI
+                if not webrtc_ctx.state.playing:
+                    # Set ke nilai default saat streaming berhenti
+                    ui_status_placeholder.markdown(
+                        f"""<div class="status-alert status-normal">⏹️ Kamera Berhenti</div>""",
+                        unsafe_allow_html=True,
                     )
+                    ui_confidence_placeholder.metric("Kepercayaan", "N/A")
+                    ui_fps_placeholder.metric("FPS", "N/A")
+                    break
+                time.sleep(
+                    0.1
+                )  # Frekuensi update UI, jangan terlalu cepat agar tidak membebani
+        # else:
+        # Jika tidak streaming, pastikan placeholder menunjukkan status non-aktif
+        # ui_status_placeholder.markdown(f"""<div class="status-alert status-normal">🎬 Klik 'START' pada video player di atas</div>""", unsafe_allow_html=True)
 
-                    current_status_name = "Tidak Terdeteksi"
-                    current_confidence = 0.0
-
-                    if detection:
-                        status_name = detection["class"]
-                        status_conf_val = detection["confidence"]
-                        current_status_name = status_name
-                        current_confidence = status_conf_val
-
-                        if status_name in STATUS_CONFIG:
-                            config = STATUS_CONFIG[status_name]
-                            status_placeholder.markdown(
-                                f"""
-                                <div class="status-alert {config['color']}">
-                                    {config['emoji']} Status: {config['level']} ({status_name})
-                                    <br>Kepercayaan: {status_conf_val:.2f}
-                                </div>
-                                """,
-                                unsafe_allow_html=True,
-                            )
-                        else:  # Jika kelas tidak ada di STATUS_CONFIG
-                            status_placeholder.markdown(
-                                f"""
-                                <div class="status-alert status-normal">
-                                    ℹ️ Status: {status_name} (Kepercayaan: {status_conf_val:.2f})
-                                </div>
-                                """,
-                                unsafe_allow_html=True,
-                            )
-                        confidence_display_placeholder.metric(
-                            "Kepercayaan", f"{status_conf_val:.3f}"
-                        )
-                    else:
-                        status_placeholder.markdown(
-                            """
-                            <div class="status-alert status-normal">
-                                🔍 Mencari wajah atau aktivitas... Sistem standby.
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-                        confidence_display_placeholder.metric("Kepercayaan", "N/A")
-
-                    frame_count += 1
-                    elapsed = time.time() - start_time
-                    if elapsed > 0.1:  # Update FPS tidak terlalu sering
-                        fps = frame_count / elapsed
-                        fps_placeholder.metric("FPS", f"{fps:.1f}")
-                        # Reset untuk perhitungan FPS berikutnya agar lebih akurat per interval
-                        # frame_count = 0
-                        # start_time = time.time()
-
-                    timestamp_placeholder.metric("Waktu", time.strftime("%H:%M:%S"))
-
-                    if capture_btn_clicked:
-                        st.toast(
-                            f"Info: Status '{current_status_name}' @{current_confidence*100:.1f}% | {time.strftime('%H:%M:%S')}",
-                            icon="💡",
-                        )
-
-                    # Penting untuk Streamlit agar UI bisa update dan tidak freeze
-                    # cv2.waitKey(1) # Tidak perlu di Streamlit, time.sleep lebih baik
-                    time.sleep(0.01)  # Mengatur refresh rate, sesuaikan jika perlu
-
-                cap.release()
-                if (
-                    not st.session_state.webcam_running
-                ):  # Hanya kosongkan jika memang di-stop
-                    video_placeholder.empty()
-                    status_placeholder.empty()
-                    fps_placeholder.empty()
-                    confidence_display_placeholder.empty()
-                    timestamp_placeholder.empty()
-                    st.info("ℹ️ Monitoring via kamera telah dihentikan.")
-
-    with tab2:
+    # --- Tab 2: Unggah Gambar ---
+    with tab_upload:
         st.header("🖼️ Analisis Gambar Siswa")
         st.write(
             "Unggah fotomu (atau screenshot saat belajar) untuk dianalisis tingkat fokusnya."
@@ -378,90 +370,82 @@ def main():
         )
 
         if uploaded_file is not None:
-            image = Image.open(uploaded_file)
+            image_pil_uploaded = Image.open(uploaded_file)
 
             st.subheader("🖼️ Pratinjau Gambar")
-            col_img1, col_img2 = st.columns(2)
-            with col_img1:
+            col_img_orig, col_img_proc = st.columns(2)
+            with col_img_orig:
                 st.caption("Gambar Asli")
-                st.image(image, use_container_width=True)
+                st.image(image_pil_uploaded, use_container_width=True)
 
             with st.spinner(
                 "🧠 Menganalisis gambar... Ini mungkin butuh beberapa detik."
             ):
-                results = model(image, verbose=False)
-                detection = get_detection_status(results, confidence_threshold)
-                detected_image = draw_detection(image.copy(), detection)
+                results_uploaded = MODEL(image_pil_uploaded, verbose=False, half=True)
+                detection_uploaded = get_detection_status(
+                    results_uploaded, confidence_threshold_slider
+                )
+                processed_image_uploaded = draw_bounding_box(
+                    image_pil_uploaded.copy(), detection_uploaded
+                )
 
-            with col_img2:
+            with col_img_proc:
                 st.caption("Hasil Deteksi")
-                st.image(detected_image, use_container_width=True)
+                st.image(processed_image_uploaded, use_container_width=True)
 
             st.markdown("---")
             st.subheader("📊 Hasil Analisis Detail")
-            if detection:
-                status_name = detection["class"]
-                status_conf_val = detection["confidence"]
+            if detection_uploaded:
+                class_name_up = detection_uploaded["class"]
+                conf_val_up = detection_uploaded["confidence"]
+                config_up = STATUS_CONFIG.get(class_name_up)
 
-                if status_name in STATUS_CONFIG:
-                    config = STATUS_CONFIG[status_name]
+                if config_up:
                     st.markdown(
                         f"""
-                        <div class="status-alert {config['color']}">
-                            {config['emoji']} STATUS TERDETEKSI: {config['level']} ({status_name})
-                            <br>Tingkat Kepercayaan Deteksi: {status_conf_val:.3f}
+                        <div class="status-alert {config_up['color']}">
+                            {config_up['emoji']} STATUS: {config_up['level']} ({class_name_up})
+                            <br>Kepercayaan: {conf_val_up:.3f}
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
-                else:  # Jika kelas tidak ada di STATUS_CONFIG
+                else:  # Kelas tidak dikenal
                     st.markdown(
-                        f"""
-                        <div class="status-alert status-normal">
-                           ℹ️ Status Terdeteksi: {status_name} (Kepercayaan: {status_conf_val:.3f})
-                        </div>
-                        """,
+                        f"""<div class="status-alert status-warning">❓ STATUS: {class_name_up} (Kepercayaan: {conf_val_up:.3f})</div>""",
                         unsafe_allow_html=True,
                     )
 
+                # Rekomendasi
                 st.subheader("💡 Rekomendasi Belajar")
-                if status_name == "Normal":
-                    st.success(
-                        "✅ Bagus! Kamu terlihat fokus dan siap menyerap materi. Pertahankan!"
-                    )
-                elif status_name == "Engaged":
-                    st.info(
-                        "👀 Keren! Kamu tampak aktif dan terlibat dalam pelajaran. Semangat terus!"
-                    )
-                elif status_name == "Distracted":
-                    st.warning(
-                        "⚠️ Hati-hati, kamu mulai terdistraksi. Coba kembalikan fokusmu pada pelajaran, ya!"
-                    )
-                elif status_name in [
+                if class_name_up == "Normal":
+                    st.success("✅ Bagus! Kamu terlihat fokus. Pertahankan!")
+                elif class_name_up == "Engaged":
+                    st.info("👀 Keren! Kamu tampak aktif. Semangat terus!")
+                elif class_name_up == "Distracted":
+                    st.warning("⚠️ Kamu mulai terdistraksi. Ayo fokus lagi!")
+                elif class_name_up in [
                     "Face Covered",
                     "Face Concealed",
                     "Face Not Visible",
                 ]:
                     st.warning(
-                        "😷 Wajahmu tidak terlihat jelas oleh kamera. Pastikan posisimu sudah pas agar bisa terpantau."
+                        "😷 Wajahmu tidak terlihat jelas. Pastikan posisi kamera pas."
                     )
-                elif status_name == "Object Detected":
-                    st.warning(
-                        "📱 Ada objek (seperti HP) yang terdeteksi. Singkirkan dulu yuk agar lebih fokus belajar!"
-                    )
-                elif status_name == "Compromised":
+                elif class_name_up == "Object Detected":
+                    st.warning("📱 Ada objek (mis. HP) terdeteksi. Singkirkan dulu ya!")
+                elif class_name_up == "Compromised":
                     st.error(
-                        "🚨 PERLU PERHATIAN! Kamu terlihat sangat tidak fokus atau mungkin lelah. Coba istirahat sebentar, minum air, atau regangkan badan."
+                        "🚨 PERLU PERHATIAN! Kamu terlihat sangat tidak fokus. Coba istirahat sebentar."
                     )
             else:
                 st.info(
-                    "ℹ️ Tidak ada aktivitas atau wajah yang terdeteksi dengan jelas pada gambar ini sesuai ambang batas kepercayaan."
+                    "ℹ️ Tidak ada aktivitas atau wajah yang terdeteksi dengan jelas pada gambar ini."
                 )
+
     st.markdown("---")
-    st.markdown(
-        "© 2024 - Aplikasi Monitor Deteksi Distraksi Siswa (Versi Kustom oleh AI)"
-    )  # Tahun diubah
+    st.markdown("© 2025 - Aplikasi Monitor Deteksi Distraksi Siswa")
 
 
 if __name__ == "__main__":
-    main()
+    main_app()
