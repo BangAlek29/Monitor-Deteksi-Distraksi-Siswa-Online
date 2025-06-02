@@ -1,463 +1,387 @@
-import streamlit as st
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from PIL import Image
 import time
+import threading
+from collections import deque
+import matplotlib.pyplot as plt
+from datetime import datetime
+import os
 
-# Konfigurasi halaman
-st.set_page_config(
-    page_title="Student Attention Monitor", page_icon="🎓", layout="wide"
-)
-
-# CSS untuk styling yang modern dan simpel
-st.markdown(
-    """
-<style>
-    .main-container {
-        max-width: 1200px;
-        margin: 0 auto;
-    }
+class RealtimeAttentionMonitor:
+    def __init__(self, model_path="best.pt", confidence_threshold=0.6):
+        """
+        Initialize the realtime attention monitor
+        """
+        self.model_path = model_path
+        self.confidence_threshold = confidence_threshold
+        self.model = None
+        self.cap = None
+        self.running = False
+        
+        # Status tracking
+        self.current_status = "Standby"
+        self.status_history = deque(maxlen=100)  # Keep last 100 status updates
+        self.focus_sessions = 0
+        self.total_focused_time = 0
+        self.session_start_time = None
+        self.last_status_change = time.time()
+        
+        # Performance metrics
+        self.fps_counter = deque(maxlen=30)
+        self.frame_count = 0
+        
+        # Colors for different statuses
+        self.colors = {
+            "Engaged": (0, 255, 0),      # Green
+            "Compromised": (0, 0, 255),  # Red
+            "Standby": (128, 128, 128)   # Gray
+        }
+        
+        # Load model
+        self.load_model()
+        
+    def load_model(self):
+        """Load YOLO model"""
+        try:
+            self.model = YOLO(self.model_path)
+            print(f"✅ Model loaded successfully: {self.model_path}")
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            print("💡 Trying to load default YOLOv8n model...")
+            try:
+                self.model = YOLO("yolov8n.pt")
+                print("✅ Default YOLOv8n model loaded")
+            except Exception as e2:
+                print(f"❌ Failed to load any model: {e2}")
+                self.model = None
     
-    .status-card {
-        padding: 2rem;
-        border-radius: 1rem;
-        margin: 1rem 0;
-        text-align: center;
-        font-size: 1.5rem;
-        font-weight: bold;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        transition: all 0.3s ease;
-    }
+    def classify_attention(self, results):
+        """Classify attention level based on detection results"""
+        person_detected = False
+        max_confidence = 0
+        face_area = 0
+        
+        for result in results:
+            boxes = result.boxes
+            if boxes is not None:
+                for box in boxes:
+                    confidence = float(box.conf[0])
+                    class_id = int(box.cls[0])
+                    
+                    # Class 0 is usually 'person' in YOLO
+                    if class_id == 0 and confidence >= self.confidence_threshold:
+                        person_detected = True
+                        max_confidence = max(max_confidence, confidence)
+                        
+                        # Calculate face area (as a proxy for attention)
+                        x1, y1, x2, y2 = box.xyxy[0]
+                        area = (x2 - x1) * (y2 - y1)
+                        face_area = max(face_area, area)
+        
+        # Determine status based on detection
+        if person_detected and max_confidence > 0.7:
+            return {
+                "status": "Engaged",
+                "confidence": max_confidence,
+                "detected": True,
+                "area": face_area
+            }
+        elif person_detected:
+            return {
+                "status": "Engaged",
+                "confidence": max_confidence,
+                "detected": True,
+                "area": face_area
+            }
+        else:
+            return {
+                "status": "Compromised",
+                "confidence": 0.0,
+                "detected": False,
+                "area": 0
+            }
     
-    .status-engaged { 
-        background: linear-gradient(135deg, #10B981, #34D399);
-        color: white;
-        border: 3px solid #059669;
-    }
+    def draw_interface(self, frame, detection_result):
+        """Draw monitoring interface on frame"""
+        height, width = frame.shape[:2]
+        
+        # Create overlay
+        overlay = frame.copy()
+        
+        # Status panel
+        status = detection_result["status"]
+        confidence = detection_result["confidence"]
+        
+        # Draw status panel background
+        panel_height = 120
+        cv2.rectangle(overlay, (0, 0), (width, panel_height), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+        
+        # Status text
+        status_color = self.colors[status]
+        cv2.putText(frame, f"Status: {status}", (20, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+        
+        if detection_result["detected"]:
+            cv2.putText(frame, f"Confidence: {confidence:.3f}", (20, 60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        # Session metrics
+        if self.session_start_time:
+            elapsed = time.time() - self.session_start_time
+            minutes, seconds = divmod(int(elapsed), 60)
+            cv2.putText(frame, f"Session: {minutes:02d}:{seconds:02d}", (20, 90), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        cv2.putText(frame, f"Focus Sessions: {self.focus_sessions}", (250, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        # FPS counter
+        if len(self.fps_counter) > 1:
+            fps = len(self.fps_counter) / (self.fps_counter[-1] - self.fps_counter[0])
+            cv2.putText(frame, f"FPS: {fps:.1f}", (width - 120, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        # Instructions panel
+        instructions = [
+            "Press 'q' to quit",
+            "Press 'r' to reset session",
+            "Press 's' to save screenshot",
+            "Press 'c' to change confidence threshold"
+        ]
+        
+        for i, instruction in enumerate(instructions):
+            cv2.putText(frame, instruction, (20, height - 80 + i * 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        return frame
     
-    .status-compromised { 
-        background: linear-gradient(135deg, #EF4444, #F87171);
-        color: white;
-        border: 3px solid #DC2626;
-    }
+    def draw_detection_boxes(self, frame, results):
+        """Draw detection bounding boxes"""
+        for result in results:
+            boxes = result.boxes
+            if boxes is not None:
+                for box in boxes:
+                    confidence = float(box.conf[0])
+                    class_id = int(box.cls[0])
+                    
+                    if confidence >= self.confidence_threshold and class_id == 0:
+                        # Get coordinates
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        
+                        # Choose color based on confidence
+                        if confidence > 0.8:
+                            color = (0, 255, 0)  # High confidence - Green
+                        elif confidence > 0.6:
+                            color = (0, 255, 255)  # Medium confidence - Yellow
+                        else:
+                            color = (0, 165, 255)  # Low confidence - Orange
+                        
+                        # Draw rectangle
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        
+                        # Draw label
+                        label = f"Person: {confidence:.2f}"
+                        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+                        cv2.rectangle(frame, (x1, y1 - label_size[1] - 10), 
+                                    (x1 + label_size[0], y1), color, -1)
+                        cv2.putText(frame, label, (x1, y1 - 5), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        
+        return frame
     
-    .status-monitoring { 
-        background: linear-gradient(135deg, #3B82F6, #60A5FA);
-        color: white;
-        border: 3px solid #2563EB;
-    }
+    def update_status(self, new_status):
+        """Update attention status and track changes"""
+        current_time = time.time()
+        
+        if new_status != self.current_status:
+            # Status changed
+            if new_status == "Engaged" and self.current_status != "Engaged":
+                self.focus_sessions += 1
+                print(f"📈 Focus session #{self.focus_sessions} started")
+            
+            self.current_status = new_status
+            self.last_status_change = current_time
+            
+        # Add to history
+        self.status_history.append({
+            "timestamp": current_time,
+            "status": new_status,
+            "session": self.focus_sessions
+        })
     
-    .status-standby { 
-        background: linear-gradient(135deg, #8B5CF6, #A78BFA);
-        color: white;
-        border: 3px solid #7C3AED;
-    }
+    def save_screenshot(self, frame):
+        """Save current frame as screenshot"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"attention_screenshot_{timestamp}.jpg"
+        cv2.imwrite(filename, frame)
+        print(f"📸 Screenshot saved: {filename}")
+        return filename
     
-    .webcam-container {
-        background: #f8f9fa;
-        border-radius: 1rem;
-        padding: 1rem;
-        border: 2px solid #e9ecef;
-        text-align: center;
-    }
+    def start_monitoring(self, camera_index=0):
+        """Start realtime monitoring"""
+        if self.model is None:
+            print("❌ No model loaded. Cannot start monitoring.")
+            return
+        
+        # Initialize camera
+        self.cap = cv2.VideoCapture(camera_index)
+        if not self.cap.isOpened():
+            print("❌ Error: Could not open camera")
+            return
+        
+        # Set camera properties for better performance
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        
+        print("🎥 Starting realtime monitoring...")
+        print("📋 Controls:")
+        print("   - Press 'q' to quit")
+        print("   - Press 'r' to reset session")
+        print("   - Press 's' to save screenshot")
+        print("   - Press 'c' to change confidence threshold")
+        print("   - Press SPACE to pause/resume")
+        
+        self.running = True
+        self.session_start_time = time.time()
+        paused = False
+        
+        try:
+            while self.running:
+                if not paused:
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        print("❌ Failed to read frame from camera")
+                        break
+                    
+                    # Update FPS counter
+                    current_time = time.time()
+                    self.fps_counter.append(current_time)
+                    
+                    # Run detection
+                    results = self.model(frame, verbose=False)
+                    detection_result = self.classify_attention(results)
+                    
+                    # Update status
+                    self.update_status(detection_result["status"])
+                    
+                    # Draw detection boxes
+                    frame = self.draw_detection_boxes(frame, results)
+                    
+                    # Draw interface
+                    frame = self.draw_interface(frame, detection_result)
+                    
+                    # Show frame
+                    cv2.imshow('Student Attention Monitor - Realtime', frame)
+                
+                # Handle keyboard input
+                key = cv2.waitKey(1) & 0xFF
+                
+                if key == ord('q'):
+                    print("🛑 Stopping monitoring...")
+                    break
+                elif key == ord('r'):
+                    self.reset_session()
+                    print("🔄 Session reset")
+                elif key == ord('s'):
+                    if not paused:
+                        self.save_screenshot(frame)
+                elif key == ord('c'):
+                    self.change_confidence_threshold()
+                elif key == ord(' '):  # Space key
+                    paused = not paused
+                    status_text = "⏸️ PAUSED" if paused else "▶️ RESUMED"
+                    print(f"{status_text}")
+                
+        except KeyboardInterrupt:
+            print("\n🛑 Monitoring interrupted by user")
+        
+        finally:
+            self.stop_monitoring()
     
-    .metric-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-        gap: 1rem;
-        margin: 1rem 0;
-    }
+    def change_confidence_threshold(self):
+        """Interactive confidence threshold change"""
+        print(f"\n🎯 Current confidence threshold: {self.confidence_threshold}")
+        try:
+            new_threshold = float(input("Enter new threshold (0.1-0.9): "))
+            if 0.1 <= new_threshold <= 0.9:
+                self.confidence_threshold = new_threshold
+                print(f"✅ Confidence threshold updated to: {new_threshold}")
+            else:
+                print("❌ Invalid threshold. Must be between 0.1 and 0.9")
+        except ValueError:
+            print("❌ Invalid input. Please enter a number.")
     
-    .metric-item {
-        background: white;
-        padding: 1.5rem;
-        border-radius: 0.8rem;
-        text-align: center;
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
-        border: 1px solid #e5e7eb;
-    }
+    def reset_session(self):
+        """Reset monitoring session"""
+        self.focus_sessions = 0
+        self.total_focused_time = 0
+        self.session_start_time = time.time()
+        self.status_history.clear()
+        self.current_status = "Standby"
     
-    .metric-value {
-        font-size: 2rem;
-        font-weight: bold;
-        color: #1f2937;
-    }
+    def stop_monitoring(self):
+        """Stop monitoring and cleanup"""
+        self.running = False
+        if self.cap:
+            self.cap.release()
+        cv2.destroyAllWindows()
+        
+        # Print session summary
+        if self.session_start_time:
+            total_time = time.time() - self.session_start_time
+            minutes, seconds = divmod(int(total_time), 60)
+            print(f"\n📊 Session Summary:")
+            print(f"   ⏱️  Total time: {minutes:02d}:{seconds:02d}")
+            print(f"   🎯 Focus sessions: {self.focus_sessions}")
+            print(f"   📈 Status changes: {len(self.status_history)}")
+        
+        print("👋 Monitoring stopped. Thanks for using Student Attention Monitor!")
     
-    .metric-label {
-        color: #6b7280;
-        font-size: 0.9rem;
-        margin-top: 0.5rem;
-    }
-    
-    .header-title {
-        text-align: center;
-        color: #1f2937;
-        margin-bottom: 2rem;
-    }
-    
-    .instructions {
-        background: #f0f9ff;
-        border: 1px solid #0ea5e9;
-        border-radius: 0.8rem;
-        padding: 1.5rem;
-        margin: 1rem 0;
-    }
-    
-    .camera-info {
-        background: #fef3c7;
-        border: 1px solid #f59e0b;
-        border-radius: 0.8rem;
-        padding: 1rem;
-        margin: 1rem 0;
-        text-align: center;
-    }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-# Status configuration - hanya 2 status utama
-STATUS_CONFIG = {
-    "Engaged": {
-        "color": "status-engaged",
-        "emoji": "✅",
-        "level": "FOKUS",
-        "message": "Siswa sedang memperhatikan pelajaran",
-    },
-    "Compromised": {
-        "color": "status-compromised",
-        "emoji": "⚠️",
-        "level": "TIDAK FOKUS",
-        "message": "Siswa tidak memperhatikan atau teralihkan",
-    },
-}
-
-
-@st.cache_resource
-def load_model():
-    """Load YOLO model"""
-    try:
-        # Gunakan model YOLOv8 default atau model custom Anda
-        model = YOLO("best.pt")  # Ganti dengan "best.pt" jika ada model custom
-        return model
-    except Exception as e:
-        st.error(f"❌ Error loading model: {e}")
-        st.info("💡 Pastikan file model 'best.pt' atau 'yolov8n.pt' tersedia")
-        return None
-
-
-def classify_attention(results, confidence_threshold=0.5):
-    """Klasifikasi tingkat perhatian siswa berdasarkan deteksi"""
-    person_detected = False
-    max_confidence = 0
-    face_detected = False
-
-    for result in results:
-        boxes = result.boxes
-        if boxes is not None:
-            for box in boxes:
-                confidence = float(box.conf[0])
-                class_id = int(box.cls[0])
-
-                # Class 0 biasanya adalah 'person' di YOLO
-                if class_id == 0 and confidence >= confidence_threshold:
-                    person_detected = True
-                    max_confidence = max(max_confidence, confidence)
-
-                    # Jika deteksi person dengan confidence tinggi, anggap sebagai engaged
-                    if confidence > 0.7:
-                        face_detected = True
-
-    if person_detected and face_detected:
-        return {"status": "Engaged", "confidence": max_confidence, "detected": True}
-    elif person_detected:
-        return {"status": "Engaged", "confidence": max_confidence, "detected": True}
-    else:
-        return {"status": "Compromised", "confidence": 0.0, "detected": False}
-
-
-def draw_detection_boxes(image, results, confidence_threshold=0.5):
-    """Gambar bounding box pada deteksi"""
-    img_array = np.array(image)
-
-    for result in results:
-        boxes = result.boxes
-        if boxes is not None:
-            for box in boxes:
-                confidence = float(box.conf[0])
-                class_id = int(box.cls[0])
-
-                if confidence >= confidence_threshold:
-                    # Koordinat bounding box
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-
-                    # Warna berdasarkan class
-                    if class_id == 0:  # person
-                        color = (0, 255, 0) if confidence > 0.7 else (255, 255, 0)
-                    else:
-                        color = (255, 0, 0)
-
-                    # Gambar rectangle
-                    cv2.rectangle(img_array, (x1, y1), (x2, y2), color, 2)
-
-                    # Label
-                    label = f"Person: {confidence:.2f}"
-                    cv2.putText(
-                        img_array,
-                        label,
-                        (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        2,
-                    )
-
-    return Image.fromarray(img_array)
+    def generate_report(self):
+        """Generate attention report from history"""
+        if not self.status_history:
+            print("❌ No data available for report")
+            return
+        
+        # Calculate statistics
+        engaged_count = sum(1 for entry in self.status_history if entry["status"] == "Engaged")
+        total_count = len(self.status_history)
+        engagement_rate = (engaged_count / total_count) * 100 if total_count > 0 else 0
+        
+        print(f"\n📋 Attention Report:")
+        print(f"   📊 Engagement Rate: {engagement_rate:.1f}%")
+        print(f"   ✅ Engaged Frames: {engaged_count}/{total_count}")
+        print(f"   🎯 Focus Sessions: {self.focus_sessions}")
+        
+        # Save detailed report
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_file = f"attention_report_{timestamp}.txt"
+        
+        with open(report_file, 'w') as f:
+            f.write("Student Attention Monitoring Report\n")
+            f.write("=" * 40 + "\n\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Engagement Rate: {engagement_rate:.1f}%\n")
+            f.write(f"Engaged Frames: {engaged_count}/{total_count}\n")
+            f.write(f"Focus Sessions: {self.focus_sessions}\n\n")
+            
+            f.write("Status History:\n")
+            f.write("-" * 20 + "\n")
+            for entry in self.status_history:
+                timestamp = datetime.fromtimestamp(entry["timestamp"]).strftime('%H:%M:%S')
+                f.write(f"{timestamp} - {entry['status']} (Session #{entry['session']})\n")
+        
+        print(f"📄 Detailed report saved: {report_file}")
 
 
 def main():
-    # Initialize session state
-    if "focus_sessions" not in st.session_state:
-        st.session_state.focus_sessions = 0
-    if "start_time" not in st.session_state:
-        st.session_state.start_time = None
-    if "last_status" not in st.session_state:
-        st.session_state.last_status = "Standby"
-
-    # Header
-    st.markdown(
-        """
-    <div class="header-title">
-        <h1>🎓 Student Attention Monitor</h1>
-        <p style="font-size: 1.2rem; color: #6b7280;">Sistem Monitoring Perhatian Siswa untuk Pembelajaran Online</p>
-    </div>
-    """,
-        unsafe_allow_html=True,
-    )
-
-    # Load model
-    model = load_model()
-    if model is None:
-        st.stop()
-
-    # Layout utama
-    col1, col2 = st.columns([2, 1])
-
-    with col1:
-        st.markdown("### 📷 Live Camera Feed")
-
-        # Webcam input menggunakan Streamlit
-        camera_input = st.camera_input("📸 Ambil foto untuk monitoring")
-
-        if camera_input is not None:
-            # Convert uploaded image
-            image = Image.open(camera_input)
-
-            # Jalankan deteksi
-            with st.spinner("🔄 Analyzing..."):
-                results = model(image, verbose=False)
-                detection = classify_attention(results, confidence_threshold=0.6)
-
-                # Gambar bounding box
-                processed_image = draw_detection_boxes(
-                    image, results, confidence_threshold=0.6
-                )
-
-            # Tampilkan hasil
-            col_img1, col_img2 = st.columns(2)
-
-            with col_img1:
-                st.markdown("**📷 Original**")
-                st.image(image, use_container_width=True)
-
-            with col_img2:
-                st.markdown("**🎯 Detection Result**")
-                st.image(processed_image, use_container_width=True)
-
-            # Update status
-            status = detection["status"]
-            config = STATUS_CONFIG[status]
-
-            # Update session tracking
-            if st.session_state.last_status != status:
-                if status == "Engaged":
-                    st.session_state.focus_sessions += 1
-                st.session_state.last_status = status
-
-            if st.session_state.start_time is None:
-                st.session_state.start_time = time.time()
-
-            # Display status
-            st.markdown(
-                f"""
-            <div class="status-card {config['color']}">
-                {config['emoji']} {config['level']}
-                <br><small>{config['message']}</small>
-                <br><small>Confidence: {detection['confidence']:.3f}</small>
-            </div>
-            """,
-                unsafe_allow_html=True,
-            )
-
-        else:
-            # Instruksi penggunaan
-            st.markdown(
-                """
-            <div class="instructions">
-                <h4>📋 Cara Penggunaan:</h4>
-                <ol>
-                    <li>Klik tombol "Take Photo" di atas untuk mengaktifkan kamera</li>
-                    <li>Posisikan wajah Anda di depan kamera</li>
-                    <li>Tekan tombol untuk mengambil foto</li>
-                    <li>Sistem akan menganalisis tingkat perhatian Anda</li>
-                    <li>Ulangi proses untuk monitoring berkelanjutan</li>
-                </ol>
-            </div>
-            """,
-                unsafe_allow_html=True,
-            )
-
-            st.markdown(
-                """
-            <div class="camera-info">
-                <h4>📷 Camera Ready</h4>
-                <p>Klik tombol "Take Photo" untuk memulai monitoring</p>
-                <p>Pastikan pencahayaan cukup dan wajah terlihat jelas</p>
-            </div>
-            """,
-                unsafe_allow_html=True,
-            )
-
-    with col2:
-        st.markdown("### ⚙️ Control Panel")
-
-        # Settings
-        confidence_threshold = st.slider(
-            "Confidence Threshold",
-            min_value=0.3,
-            max_value=0.9,
-            value=0.6,
-            step=0.05,
-            help="Tingkat kepercayaan minimum untuk deteksi",
-        )
-
-        # Status legend
-        st.markdown("### 📊 Status Legend")
-        st.markdown(
-            """
-        - ✅ **FOKUS** - Siswa memperhatikan pelajaran
-        - ⚠️ **TIDAK FOKUS** - Siswa teralihkan atau tidak terlihat
-        """
-        )
-
-        # Reset button
-        if st.button("🔄 Reset Session", use_container_width=True):
-            st.session_state.focus_sessions = 0
-            st.session_state.start_time = None
-            st.session_state.last_status = "Standby"
-            st.success("Session direset!")
-            st.rerun()
-
-        # File upload untuk testing
-        st.markdown("### 🖼️ Upload Test Image")
-        uploaded_file = st.file_uploader(
-            "Upload foto untuk testing",
-            type=["jpg", "jpeg", "png"],
-            help="Upload foto siswa untuk testing sistem",
-        )
-
-        if uploaded_file is not None:
-            image = Image.open(uploaded_file)
-            st.image(image, caption="Test Image", use_container_width=True)
-
-            with st.spinner("🔄 Analyzing..."):
-                results = model(image, verbose=False)
-                detection = classify_attention(results, confidence_threshold)
-
-            # Display result
-            status = detection["status"]
-            config = STATUS_CONFIG[status]
-
-            st.markdown(
-                f"""
-            <div class="status-card {config['color']}">
-                {config['emoji']} {config['level']}
-                <br><small>{config['message']}</small>
-            </div>
-            """,
-                unsafe_allow_html=True,
-            )
-
-    # Status display area dan metrics
-    st.markdown("---")
-    status_col1, status_col2 = st.columns([1, 1])
-
-    with status_col1:
-        if camera_input is not None or uploaded_file is not None:
-            # Menampilkan status terkini
-            pass  # Status sudah ditampilkan di atas
-        else:
-            st.markdown(
-                """
-            <div class="status-card status-standby">
-                🔍 SISTEM STANDBY
-                <br><small>Menunggu input kamera...</small>
-            </div>
-            """,
-                unsafe_allow_html=True,
-            )
-
-    with status_col2:
-        # Metrics
-        if st.session_state.start_time:
-            elapsed_time = int(time.time() - st.session_state.start_time)
-            minutes, seconds = divmod(elapsed_time, 60)
-            time_str = f"{minutes:02d}:{seconds:02d}"
-        else:
-            time_str = "00:00"
-
-        st.markdown(
-            f"""
-        <div class="metric-grid">
-            <div class="metric-item">
-                <div class="metric-value">{st.session_state.focus_sessions}</div>
-                <div class="metric-label">Sesi Fokus</div>
-            </div>
-            <div class="metric-item">
-                <div class="metric-value">{time_str}</div>
-                <div class="metric-label">Waktu Monitoring</div>
-            </div>
-        </div>
-        """,
-            unsafe_allow_html=True,
-        )
-
-    # Footer information
-    st.markdown("---")
-    st.markdown(
-        """
-    <div style="text-align: center; color: #6b7280; padding: 1rem;">
-        <h4>💡 Tips Penggunaan</h4>
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem; max-width: 800px; margin: 0 auto;">
-            <div style="background: #f9fafb; padding: 1rem; border-radius: 0.5rem;">
-                <strong>📷 Kamera</strong><br>
-                Pastikan pencahayaan cukup dan wajah terlihat jelas
-            </div>
-            <div style="background: #f9fafb; padding: 1rem; border-radius: 0.5rem;">
-                <strong>🎯 Posisi</strong><br>
-                Posisikan wajah di tengah frame kamera
-            </div>
-            <div style="background: #f9fafb; padding: 1rem; border-radius: 0.5rem;">
-                <strong>⏱️ Monitoring</strong><br>
-                Ambil foto secara berkala untuk tracking yang akurat
-            </div>
-        </div>
-    </div>
-    """,
-        unsafe_allow_html=True,
-    )
-
-
-if __name__ == "__main__":
-    main()
+    """Main function to run the realtime monitor"""
+    print("🎓 Student Attention Monitor - Realtime Version")
+    print("=" * 50)
+    
+    # Initialize monitor
+    monitor = RealtimeAttentionMonitor(model_path="best.pt", confidence_threshold=0.6)
+    monitor.start_monitoring(camera_index=0)
